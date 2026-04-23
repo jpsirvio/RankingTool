@@ -1,3 +1,24 @@
+"""
+ranking_engine.py — Core ranking logic for the Ranking Tool.
+
+Architecture:
+  TierConfig     — stores the ordered list of tier names and their display
+                   colors (background + text).  Serialises to/from JSON.
+  Rating         — a single item's TrueSkill-style (mu, sigma) rating.
+  RankingSnapshot — immutable copy of engine state used by the undo stack.
+  RankingEngine  — orchestrates pair selection, rating updates, stability
+                   detection, serialisation, and undo.
+
+Pair selection strategy:
+  1. Prefer neighbours in the current ranking (highest information gain).
+  2. Add random same-tier exploration pairs for diversity.
+  3. Fall back to any remaining unranked eligible pair.
+  4. Return None when all eligible pairs have been ranked.
+
+Undo is O(1): each submit() pushes a full snapshot onto a stack;
+undo_last() simply pops and restores — no history replay needed.
+"""
+
 import random
 import math
 import copy
@@ -184,6 +205,14 @@ class RankingEngine:
         return True
 
     def get_next_pair(self) -> Optional[tuple[str, str]]:
+        """
+        Return the best unranked pair to present next, or None if exhausted.
+
+        Selection order:
+          1. Ranking neighbours with highest combined sigma (most uncertain).
+          2. Random same-tier pairs for exploration (10 attempts).
+          3. Brute-force scan of all remaining eligible unranked pairs.
+        """
         eligible = self._eligible_names()
         if len(eligible) < 2:
             return None
@@ -245,6 +274,15 @@ class RankingEngine:
     # ------------------------------------------------------------------
 
     def submit_result(self, a: str, b: str, result: MatchResult):
+        """
+        Record the outcome of one comparison.
+
+        - Pushes an undo snapshot *before* any state mutation.
+        - Appends to history and increments match counters.
+        - For non-SKIP results: updates ratings and marks the pair as ranked
+          in self.ranked_pairs so it is never presented again.
+        - Checks stability after every real verdict.
+        """
         self._snapshots.append(RankingSnapshot(
             ratings={k: Rating(v.mu, v.sigma) for k, v in self.ratings.items()},
             history=copy.deepcopy(self.history),
@@ -320,6 +358,14 @@ class RankingEngine:
         return {n: self.ratings[n].mu for n in self.names}
 
     def get_confidence(self) -> float:
+        """
+        Return a 0–100 confidence score for the current ranking.
+
+        Combines:
+          - sigma_score:     how much ratings have converged (low sigma → high score)
+          - stability_score: how many consecutive comparisons left the top-10 unchanged
+        Both components are weighted equally.
+        """
         avg_sigma = sum(r.sigma for r in self.ratings.values()) / max(len(self.ratings), 1)
         sigma_score = max(0.0, 1.0 - (avg_sigma / 8.333))
         stability_score = min(1.0, self.stable_counter / self.STABLE_THRESHOLD)

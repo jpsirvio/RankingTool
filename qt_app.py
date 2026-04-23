@@ -1,3 +1,23 @@
+"""
+qt_app.py — PyQt5 front-end for the Ranking Tool.
+
+Screen flow:
+  0. ProjectBrowserScreen — list / open / delete saved projects
+  1. ListManagerScreen    — create or edit a list and its tier config
+  2. TierAssignmentScreen — assign each item to a tier (flash-card + drag board)
+  3. RankingScreen        — pairwise comparisons, live results, auto-save
+
+All persistent state is stored in JSON files under ./projects/.
+File names are UUIDs; human-readable names come from the JSON payload.
+Auto-save fires after every comparison, undo, and reset so no progress is lost.
+
+Key classes:
+  TierColorDialog  — modal dialog for picking per-tier bg/text colors
+  TierRowWidget    — one row in the tier editor (pill preview + action buttons)
+  ProjectBrowserScreen, ListManagerScreen, TierAssignmentScreen, RankingScreen
+  MainWindow       — QMainWindow that owns the QStackedWidget and wires signals
+"""
+
 import sys
 import json
 import uuid
@@ -43,7 +63,9 @@ PALETTE = {
     "win_b":    "#1e3a2f",
 }
 
-# Swatch palette shown in the color picker dialog
+# Swatch palette shown in the TierColorDialog.
+# 36 colors arranged in thematic groups: reds/oranges, yellows/greens,
+# blues, purples/pinks, dark neutrals, and light values for text use.
 SWATCHES = [
     # Reds / Oranges
     "#b91c1c", "#dc2626", "#ef4444", "#f97316", "#c2410c", "#ea580c",
@@ -428,16 +450,17 @@ class TierRowWidget(QWidget):
         layout.setContentsMargins(4, 2, 4, 2)
         layout.setSpacing(6)
 
-        # Color pill preview
+        # Colored pill preview — shows tier name with its bg/text colors
         self._pill = QLabel(self.tier_name)
         self._pill.setAlignment(Qt.AlignCenter)
         self._pill.setFixedHeight(28)
-        self._pill.setMinimumWidth(48)
+        self._pill.setMinimumWidth(56)
         self._apply_pill()
         layout.addWidget(self._pill)
 
         layout.addStretch()
 
+        # Action buttons — let Qt size width from content so text always fits
         for label, signal in [
             ("Rename", self.rename_requested),
             ("Colors", self.color_requested),
@@ -445,14 +468,16 @@ class TierRowWidget(QWidget):
             ("↓",      self.move_down),
         ]:
             btn = QPushButton(label)
-            btn.setFixedHeight(26)
-            btn.setMaximumWidth(64 if len(label) > 2 else 32)
+            btn.setFixedHeight(28)
+            btn.setMinimumWidth(32)
+            btn.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
             btn.clicked.connect(lambda _, s=signal: s.emit(self.tier_name))
             layout.addWidget(btn)
 
         del_btn = QPushButton("✕")
         del_btn.setObjectName("danger")
-        del_btn.setFixedSize(28, 26)
+        del_btn.setFixedHeight(28)
+        del_btn.setMinimumWidth(30)
         del_btn.clicked.connect(lambda: self.remove_requested.emit(self.tier_name))
         layout.addWidget(del_btn)
 
@@ -477,6 +502,14 @@ class TierRowWidget(QWidget):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ProjectBrowserScreen(QWidget):
+    """
+    Opening screen — lists all projects found in ./projects/.
+
+    Each project is shown as 'List Name — YYYY.MM.DD HH:MM:SS'.
+    Double-click or 'Open selected' loads the project.  If tier assignment
+    is incomplete the app navigates to TierAssignmentScreen; otherwise it
+    goes directly to RankingScreen.
+    """
     open_project = pyqtSignal(Path, dict)
     new_project  = pyqtSignal()
 
@@ -564,6 +597,16 @@ class ProjectBrowserScreen(QWidget):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ListManagerScreen(QWidget):
+    """
+    Screen 1 — create or edit a list and configure its tiers.
+
+    Left panel:  item editor (type one-by-one, paste bulk, import .txt).
+    Right panel: tier editor — each tier is a TierRowWidget with Rename,
+                 Colors, move-up/down, and remove buttons.  Clicking Colors
+                 opens TierColorDialog.
+
+    Emits proceed(list_name, values, TierConfig) when the user continues.
+    """
     proceed = pyqtSignal(str, list, object)   # list_name, values, TierConfig
     back    = pyqtSignal()
 
@@ -960,6 +1003,18 @@ class TierBucket(QFrame):
 
 
 class TierAssignmentScreen(QWidget):
+    """
+    Screen 2 — assign each item in the list to a tier.
+
+    Two interaction modes:
+      Flash-card: items are presented one at a time; clicking a tier button
+                  assigns the item and advances to the next.
+      Drag board: all assigned items are shown as colored pills inside their
+                  tier bucket; drag a pill to a different bucket to reassign.
+
+    On proceed, any still-unassigned items are automatically placed in the
+    last tier so no item is silently excluded from ranking.
+    """
     proceed = pyqtSignal(object)
     back    = pyqtSignal()
 
@@ -1114,16 +1169,19 @@ class TierAssignmentScreen(QWidget):
         self._update_flash()
 
     def _proceed(self):
+        """
+        Move to the ranking phase.
+        Any items still unassigned are automatically placed in the last tier
+        so they are always included in comparisons — no items are silently dropped.
+        """
         unassigned = self.engine.get_untiered_items()
         if unassigned:
-            reply = QMessageBox.question(
-                self, "Unassigned items",
-                f"{len(unassigned)} item(s) not yet assigned to a tier.\n"
-                "They will be skipped during same-tier ranking.\n\nContinue anyway?",
-                QMessageBox.Yes | QMessageBox.No,
-            )
-            if reply == QMessageBox.No:
-                return
+            last_tier = self.engine.tier_config.tiers[-1]
+            for name in unassigned:
+                self.engine.assign_tier(name, last_tier)
+                # Also update the drag-board bucket so the UI stays consistent
+                if last_tier in self._buckets:
+                    self._buckets[last_tier].add_item(name)
         self.proceed.emit(self.engine)
 
 
@@ -1132,6 +1190,19 @@ class TierAssignmentScreen(QWidget):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class RankingScreen(QWidget):
+    """
+    Screen 3 — pairwise comparison UI.
+
+    Two items are shown side-by-side as clickable cards.  The user picks
+    the better one (or draw/skip) using mouse clicks or keyboard shortcuts:
+      A = left wins   D = right wins   S = draw   Z = undo   Space = skip
+
+    The ranking list below the cards can be sorted two ways:
+      Tier → Score  (default) — grouped by tier, ranked by score within tier
+      Score only              — flat global score order
+
+    Every comparison is auto-saved to the project JSON immediately.
+    """
     back_requested = pyqtSignal()
 
     def __init__(self):
@@ -1210,26 +1281,36 @@ class RankingScreen(QWidget):
             ctrl.addWidget(b)
         root.addLayout(ctrl)
 
-        splitter = QSplitter(Qt.Horizontal)
+        # ── Combined ranking list with sort-mode toggle ──────
+        rank_header = QHBoxLayout()
+        rank_header.addWidget(section_label("Results"))
+        rank_header.addStretch()
+        rank_header.addWidget(QLabel("Sort by:"))
 
-        lw = QWidget()
-        lv = QVBoxLayout(lw)
-        lv.setContentsMargins(0, 0, 0, 0)
-        lv.addWidget(section_label("Full Ranking"))
+        # Radio-style toggle buttons for sort mode
+        self._sort_tier_btn = QPushButton("Tier → Score")
+        self._sort_tier_btn.setCheckable(True)
+        self._sort_tier_btn.setChecked(True)   # default
+        self._sort_score_btn = QPushButton("Score only")
+        self._sort_score_btn.setCheckable(True)
+        self._sort_tier_btn.setStyleSheet(
+            f"QPushButton{{background:{PALETTE['accent']};color:#fff;border:none;"
+            f"border-radius:4px;padding:4px 10px;font-size:11px;}}"
+            f"QPushButton:!checked{{background:{PALETTE['surface2']};"
+            f"color:{PALETTE['text_dim']};border:1px solid {PALETTE['border']};}}"
+        )
+        self._sort_score_btn.setStyleSheet(self._sort_tier_btn.styleSheet())
+        self._sort_tier_btn.clicked.connect(lambda: self._set_sort("tier"))
+        self._sort_score_btn.clicked.connect(lambda: self._set_sort("score"))
+        rank_header.addWidget(self._sort_tier_btn)
+        rank_header.addWidget(self._sort_score_btn)
+        root.addLayout(rank_header)
+
         self.rank_list = QListWidget()
-        lv.addWidget(self.rank_list)
-        splitter.addWidget(lw)
+        root.addWidget(self.rank_list, 1)
 
-        rw = QWidget()
-        rv = QVBoxLayout(rw)
-        rv.setContentsMargins(0, 0, 0, 0)
-        rv.addWidget(section_label("Ranking by Tier"))
-        self.tier_rank_list = QListWidget()
-        rv.addWidget(self.tier_rank_list)
-        splitter.addWidget(rw)
-
-        splitter.setSizes([300, 300])
-        root.addWidget(splitter, 1)
+        # Track current sort mode
+        self._sort_mode = "tier"  # "tier" | "score"
 
         self.stats_lbl = QLabel("")
         self.stats_lbl.setStyleSheet(f"color:{PALETTE['text_dim']};font-size:11px;")
@@ -1315,38 +1396,7 @@ class RankingScreen(QWidget):
         conf = self.engine.get_confidence()
         self.confidence_lbl.setText(f"Confidence: {conf:.0f}%")
 
-        ranking = self.engine.get_ranking()
-        scores  = self.engine.get_scores()
-
-        self.rank_list.clear()
-        for i, name in enumerate(ranking, 1):
-            tier = self.engine.get_tier(name) or "—"
-            bg, fg = self.engine.tier_config.get_colors(tier) if tier != "—" \
-                else (PALETTE["surface2"], PALETTE["text_dim"])
-            item = QListWidgetItem(f"{i:>3}. [{tier}] {name}  ({scores[name]:.2f})")
-            item.setForeground(QColor(fg))
-            item.setBackground(QColor(bg + "33"))
-            self.rank_list.addItem(item)
-
-        self.tier_rank_list.clear()
-        by_tier = self.engine.get_ranking_by_tier()
-        for tier in self.engine.tier_config.tiers:
-            items = by_tier.get(tier, [])
-            if not items:
-                continue
-            bg, fg = self.engine.tier_config.get_colors(tier)
-            header_item = QListWidgetItem(f" {tier} ")
-            header_item.setBackground(QColor(bg))
-            header_item.setForeground(QColor(fg))
-            header_item.setTextAlignment(Qt.AlignCenter)
-            self.tier_rank_list.addItem(header_item)
-            for j, name in enumerate(items, 1):
-                row_item = QListWidgetItem(
-                    f"  {j}. {name}  ({scores[name]:.2f})"
-                )
-                row_item.setForeground(QColor(fg))
-                row_item.setBackground(QColor(bg + "22"))
-                self.tier_rank_list.addItem(row_item)
+        self._refresh_rank_list()
 
         self.stats_lbl.setText(
             f"Items: {len(self.engine.names)}  |  "
@@ -1354,6 +1404,89 @@ class RankingScreen(QWidget):
             f"Ranked pairs: {len(self.engine.ranked_pairs)}  |  "
             f"Stable: {self.engine.stable_counter}/{self.engine.STABLE_THRESHOLD}"
         )
+
+    def _set_sort(self, mode: str):
+        """Switch between 'tier' (tier-first, then score) and 'score' (global score) sort."""
+        self._sort_mode = mode
+        self._sort_tier_btn.setChecked(mode == "tier")
+        self._sort_score_btn.setChecked(mode == "score")
+        self._refresh_rank_list()
+
+    def _refresh_rank_list(self):
+        """
+        Rebuild the combined ranking list using the current sort mode.
+
+        Modes:
+          "tier"  — groups items under tier headers, sorted by tier order
+                    then by descending score within each tier.
+          "score" — flat list ordered purely by descending score, with
+                    the tier label shown in brackets for reference.
+        """
+        scores  = self.engine.get_scores()
+        tc      = self.engine.tier_config
+
+        self.rank_list.clear()
+
+        if self._sort_mode == "score":
+            # Flat global ranking, pure score order
+            ranking = self.engine.get_ranking()
+            for i, name in enumerate(ranking, 1):
+                tier = self.engine.get_tier(name) or "—"
+                if tier != "—":
+                    bg, fg = tc.get_colors(tier)
+                else:
+                    bg, fg = PALETTE["surface2"], PALETTE["text_dim"]
+                item = QListWidgetItem(
+                    f"{i:>3}. [{tier}]  {name}  ({scores[name]:.2f})"
+                )
+                item.setForeground(QColor(fg))
+                item.setBackground(QColor(bg + "33"))
+                self.rank_list.addItem(item)
+
+        else:
+            # Tier-first: iterate tiers in config order, within each tier
+            # sort by descending score
+            by_tier = self.engine.get_ranking_by_tier()
+            global_rank = 1
+            for tier in tc.tiers:
+                items = by_tier.get(tier, [])
+                if not items:
+                    continue
+                bg, fg = tc.get_colors(tier)
+
+                # Tier header row
+                header = QListWidgetItem(f"  {tier}  ")
+                header.setBackground(QColor(bg))
+                header.setForeground(QColor(fg))
+                header.setTextAlignment(Qt.AlignCenter)
+                header.setFlags(Qt.NoItemFlags)   # not selectable
+                self.rank_list.addItem(header)
+
+                for name in items:
+                    item = QListWidgetItem(
+                        f"  {global_rank:>3}. {name}  ({scores[name]:.2f})"
+                    )
+                    item.setForeground(QColor(fg))
+                    item.setBackground(QColor(bg + "22"))
+                    self.rank_list.addItem(item)
+                    global_rank += 1
+
+            # Items with no tier assignment (edge case)
+            untiered = by_tier.get("(untiered)", [])
+            if untiered:
+                header = QListWidgetItem("  (untiered)  ")
+                header.setBackground(QColor(PALETTE["surface2"]))
+                header.setForeground(QColor(PALETTE["text_dim"]))
+                header.setTextAlignment(Qt.AlignCenter)
+                header.setFlags(Qt.NoItemFlags)
+                self.rank_list.addItem(header)
+                for name in untiered:
+                    item = QListWidgetItem(
+                        f"  {global_rank:>3}. {name}  ({scores[name]:.2f})"
+                    )
+                    item.setForeground(QColor(PALETTE["text_dim"]))
+                    self.rank_list.addItem(item)
+                    global_rank += 1
 
     def _toggle_cross_tier(self, checked: bool):
         if self.engine:
@@ -1457,7 +1590,8 @@ class MainWindow(QMainWindow):
         )
 
     def _on_list_proceed(self, list_name: str, values: list[str], tier_config: TierConfig):
-        created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+        # Include full timestamp so two lists with the same name are distinguishable
+        created_at = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
         project_id = uuid.uuid4().hex
         path = PROJECTS_DIR / f"{project_id}.json"
 
